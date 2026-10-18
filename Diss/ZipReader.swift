@@ -158,7 +158,7 @@ final class ZipReader {
     /// 文件 MD5 指纹（前 12 位，报错诊断用；懒计算一次）
     private var _md5Cache: String?
     /// 流式读取条目：store 分块回调；deflate 解压后一次性回调（≤maxBytes 保护）
-    func streamBytes(for entry: ZipEntry, chunk: Int = 1 << 20, sink: (Data) -> Void) throws {
+    func streamBytes(for entry: ZipEntry, chunk: Int = 1 << 20, sink: @escaping (Data) -> Void) throws {
         guard !entry.isDirectory else { return }
         try fh.seek(toOffset: entry.offset)
         let lh = [UInt8](try readFull(fh, 30))
@@ -238,12 +238,14 @@ final class ZipReader {
             throw IPAError.notZip("临时文件创建失败")
         }
         defer { try? fh.close() }
-        let cb = { (chunk: Data) in
+        var total = 0
+        let size = Int(entry.size)
+        let cb: (Data) -> Void = { chunk in
             try? fh.write(contentsOf: chunk)
             total += chunk.count
             // 节流：每 8MB 或末块回调（避免大文件数千次回调）
-            if total / (8 * 1024 * 1024) != (total - chunk.count) / (8 * 1024 * 1024) || total == Int(entry.size) {
-                progress?(total, Int(entry.size))
+            if total / (8 * 1024 * 1024) != (total - chunk.count) / (8 * 1024 * 1024) || total == size {
+                progress?(total, size)
             }
         }
         try streamBytes(for: entry, sink: cb)
