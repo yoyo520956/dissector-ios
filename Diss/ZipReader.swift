@@ -133,9 +133,9 @@ final class ZipReader {
             do {
                 let out = try Self.inflate(comp, outSize: Int(entry.size))
                 // CRC32 终检：读位置错误/数据损坏在此现形
-                let got: UInt64 = comp.withUnsafeBytes { sb -> UInt64 in
+                let got: UInt64 = out.withUnsafeBytes { sb -> UInt64 in
                     guard let sp = sb.bindMemory(to: Bytef.self).baseAddress else { return 0 }
-                    return UInt64(zlib.crc32(0, sp, uInt(comp.count)))
+                    return UInt64(zlib.crc32(0, sp, uInt(out.count)))
                 }
                 if got != UInt64(entry.crc) {
                     throw IPAError.notZip("CRC 不匹配: \(entry.path)｜文件大小=\(fileSize) md5=\(md5Fingerprint()) dataOff=\(dataOff) 算出 \(String(got, radix: 16)) 目录 \(String(entry.crc, radix: 16))")
