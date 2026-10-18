@@ -192,7 +192,7 @@ final class ZipReader {
                 zs.avail_in = uInt(src.count)
                 zs.next_out = dp
                 zs.avail_out = uInt(outSize)
-                ret = inflate(&zs, Z_FINISH)
+                ret = zlib.inflate(&zs, Z_FINISH)
                 produced = outSize - Int(zs.avail_out)
             }
         }
