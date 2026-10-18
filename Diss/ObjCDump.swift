@@ -80,6 +80,8 @@ final class ObjCDumper {
     }
 
     private func cstr(_ off: UInt64, _ maxLen: Int = 512) -> String {
+        // 微信等 iOS17+ 二进制：指针字段可能是 chained-fixup/auth-ptr raw 巨值，Int() 直接溢出 trap
+        guard off <= UInt64(Int.max) else { return "" }
         let o = Int(off)
         guard o >= 0, o < bin.count else { return "" }
         var e = o
@@ -91,6 +93,7 @@ final class ObjCDumper {
     }
 
     private func u64(_ off: UInt64) -> UInt64 {
+        guard off <= UInt64(Int.max) else { return 0 }
         let o = Int(off)
         guard o >= 0, o + 8 <= bin.count else { return 0 }
         return UInt64(bin[o]) | (UInt64(bin[o+1]) << 8) | (UInt64(bin[o+2]) << 16) | (UInt64(bin[o+3]) << 24)
@@ -98,6 +101,7 @@ final class ObjCDumper {
     }
 
     private func u32(_ off: UInt64) -> UInt32 {
+        guard off <= UInt64(Int.max) else { return 0 }
         let o = Int(off)
         guard o >= 0, o + 4 <= bin.count else { return 0 }
         return UInt32(bin[o]) | (UInt32(bin[o+1]) << 8) | (UInt32(bin[o+2]) << 16) | (UInt32(bin[o+3]) << 24)

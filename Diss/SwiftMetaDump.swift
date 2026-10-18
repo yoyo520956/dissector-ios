@@ -46,6 +46,7 @@ final class SwiftMetaDumper {
     // relative int32 @fileOff（相对自身 VA）→ 目标 fileOff
     private func rel32(_ fo: UInt64) -> UInt64? {
         guard let selfVM = fileToVM(fo) else { return nil }
+        guard fo <= UInt64(Int.max) else { return nil }
         let o = Int(fo)
         guard o >= 0, o + 4 <= bin.count else { return nil }
         let v = Int32(bitPattern: UInt32(bin[o]) | (UInt32(bin[o+1]) << 8) | (UInt32(bin[o+2]) << 16) | (UInt32(bin[o+3]) << 24))
@@ -54,6 +55,7 @@ final class SwiftMetaDumper {
     }
 
     private func cstr(_ fo: UInt64, max: Int = 256) -> String {
+        guard fo <= UInt64(Int.max) else { return "" }
         let o = Int(fo)
         guard o >= 0, o < bin.count else { return "" }
         var e = o
@@ -63,12 +65,14 @@ final class SwiftMetaDumper {
     }
 
     private func u32(_ fo: UInt64) -> UInt32 {
+        guard fo <= UInt64(Int.max) else { return 0 }
         let o = Int(fo)
         guard o >= 0, o + 4 <= bin.count else { return 0 }
         return UInt32(bin[o]) | (UInt32(bin[o+1]) << 8) | (UInt32(bin[o+2]) << 16) | (UInt32(bin[o+3]) << 24)
     }
 
     private func u16(_ fo: UInt64) -> UInt16 {
+        guard fo <= UInt64(Int.max) else { return 0 }
         let o = Int(fo)
         guard o >= 0, o + 2 <= bin.count else { return 0 }
         return UInt16(bin[o]) | (UInt16(bin[o+1]) << 8)
