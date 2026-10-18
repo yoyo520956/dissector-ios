@@ -16,7 +16,7 @@ enum XrefEngine {
     /// 扫描 __text 全段，构建 调用目标 → [调用点] 倒排表
     /// 返回 (graph, scannedInstructions)
     static func buildCallGraph(bin: Data, textSec: MachSection) -> ([UInt64: [XrefSite]], Int) {
-        let base = Int(textSec.addr - textSec.vmaddr + textSec.fileOff)
+        let base = Int(textSec.fileOffset)
         guard base >= 0, base + Int(textSec.size) <= bin.count, textSec.size >= 4 else {
             return ([:], 0)
         }
@@ -50,7 +50,7 @@ enum XrefEngine {
 
     /// adrp+add / adrp+ldr 数据引用扫描（引用了哪些地址）——供"该函数引用了什么"用
     static func dataRefs(bin: Data, textSec: MachSection, fromVA: UInt64, count: Int) -> [UInt64] {
-        let base = Int(textSec.addr - textSec.vmaddr + textSec.fileOff)
+        let base = Int(textSec.fileOffset)
         guard base >= 0 else { return [] }
         let startOff = Int(fromVA - textSec.addr)
         guard startOff >= 0, startOff + count * 4 <= Int(textSec.size) else { return [] }
