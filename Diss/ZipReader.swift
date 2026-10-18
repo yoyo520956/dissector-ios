@@ -1,5 +1,6 @@
 import Foundation
 import zlib
+import CryptoKit
 
 // 零依赖 ZIP 读取器：
 // 只解析 EOCD + central directory，按需解压单条目（Compression raw deflate）。
@@ -7,6 +8,7 @@ import zlib
 
 final class ZipReader {
     private let fh: FileHandle
+    private let fileURL: URL
     private let fileSize: UInt64
     private(set) var entries: [ZipEntry] = []
     private var entryByPath: [String: ZipEntry] = [:]
@@ -14,6 +16,7 @@ final class ZipReader {
 
     init(url: URL) throws {
         fh = try FileHandle(forReadingFrom: url)
+        fileURL = url
         // 真实文件末尾：FileManager 属性会被 iCloud 占位文件欺骗，seekToEnd 永远可信
         let endPos = try fh.seekToEnd()
         fileSize = endPos
@@ -135,21 +138,30 @@ final class ZipReader {
                     return UInt64(zlib.crc32(0, sp, uInt(comp.count)))
                 }
                 if got != UInt64(entry.crc) {
-                    throw IPAError.notZip("CRC 不匹配: \(entry.path)（算出 \(String(got, radix: 16)) 目录 \(String(entry.crc, radix: 16))）")
+                    throw IPAError.notZip("CRC 不匹配: \(entry.path)｜文件大小=\(fileSize) md5=\(md5Fingerprint()) dataOff=\(dataOff) 算出 \(String(got, radix: 16)) 目录 \(String(entry.crc, radix: 16))")
                 }
                 guard out.count == Int(entry.size) else {
                     throw IPAError.notZip("解压不完整: \(entry.path)（\(out.count)/\(entry.size)）")
                 }
                 return out
-            } catch let e as IPAError {
-                throw e
             } catch {
-                // 解压失败 → 全套诊断：读的位置 + 压缩数据指纹
+                // 统一诊断包装（不透传）：文件身份 + 读取位置 + 数据指纹
                 let head = comp.prefix(8).map { String(format: "%02X", $0) }.joined(separator: " ")
-                throw IPAError.unsupported("\(error.localizedDescription)｜诊断: localOff=\(entry.offset) dataOff=\(dataOff) 前8字节=\(head)")
+                throw IPAError.unsupported("\(error.localizedDescription)｜诊断: 文件大小=\(fileSize) md5=\(md5Fingerprint()) localOff=\(entry.offset) dataOff=\(dataOff) packed读得\(comp.count) 前8字节=\(head)")
             }
         }
         throw IPAError.unsupported("压缩方法 \(entry.method) 暂不支持（仅 store/deflate）: \(entry.path)（packed=\(entry.packed) size=\(entry.size) off=\(entry.offset)）")
+    }
+
+    /// 文件 MD5 指纹（前 12 位，报错诊断用；懒计算一次）
+    private var _md5Cache: String?
+    func md5Fingerprint() -> String {
+        if let c = _md5Cache { return c }
+        guard let d = try? Data(contentsOf: fileURL) else { return "无法读取" }
+        let h = CryptoKit.Insecure.MD5.hash(data: d).prefix(6)
+            .map { String(format: "%02x", $0) }.joined()
+        _md5Cache = h
+        return h
     }
 
     /// FileHandle 读取可能短读——循环读满为止
