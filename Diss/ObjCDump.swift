@@ -92,6 +92,21 @@ final class ObjCDumper {
             ?? ""
     }
 
+    /// 带失败传播的安全读取（nil = 越界/巨值，调用方显式放弃该字段）
+    private func u64s(_ off: UInt64) -> UInt64? {
+        guard off <= UInt64(Int.max) else { return nil }
+        let o = Int(off)
+        guard o >= 0, o + 8 <= bin.count else { return nil }
+        return u64(UInt64(o))
+    }
+
+    private func u32s(_ off: UInt64) -> UInt32? {
+        guard off <= UInt64(Int.max) else { return nil }
+        let o = Int(off)
+        guard o >= 0, o + 4 <= bin.count else { return nil }
+        return u32(UInt64(o))
+    }
+
     private func u64(_ off: UInt64) -> UInt64 {
         guard off <= UInt64(Int.max) else { return 0 }
         let o = Int(off)
@@ -122,8 +137,9 @@ final class ObjCDumper {
         var nextID = 0
         for i in 0..<count {
             let ptrOff = cl.fileOffset + UInt64(i * 8)
+            guard Int(ptrOff) >= 0, Int(ptrOff) + 8 <= bin.count else { continue }
             let raw = u64(ptrOff)
-            guard let clsOff = fileOffset(raw) else { continue }
+            guard raw > 0, raw <= UInt64(Int.max), let clsOff = fileOffset(raw) else { continue }
             if let c = dumpClass(at: clsOff, id: nextID) {
                 out.append(c)
                 nextID += 1
@@ -137,6 +153,7 @@ final class ObjCDumper {
     // MARK: - objc_class → class_ro_t
 
     private func dumpClass(at clsOff: UInt64, id: Int) -> ObjCClassDump? {
+        guard Int(clsOff) >= 0, Int(clsOff) + 40 <= bin.count else { return nil }
         let isaRaw = u64(clsOff)
         let superRaw = u64(clsOff + 8)
         let bitsRaw = u64(clsOff + 24)
@@ -154,7 +171,7 @@ final class ObjCDumper {
         let instMethods = readMethods(listVM: ptrAt(roOff + 0x20), classMethod: false)
         // 类方法（元类 ro 的 baseMethods）
         var clsMethods: [ObjCMethodDump] = []
-        if let metaOff = fileOffset(isaRaw) {
+        if let metaOff = fileOffset(isaRaw), Int(metaOff) + 32 <= bin.count {
             let metaBits = u64(metaOff + 24)
             let metaRoVM = metaBits & 0x00007FFFFFFFFFF8
             if let metaRoOff = fileOffset(metaRoVM) {
@@ -180,7 +197,8 @@ final class ObjCDumper {
     }
 
     private func readClassName(ofVM vm: UInt64) -> String {
-        guard vm > 0, let clsOff = fileOffset(vm) else { return "" }
+        guard vm > 0, vm <= UInt64(Int.max), let clsOff = fileOffset(vm),
+              Int(clsOff) + 32 <= bin.count else { return "" }
         let bits = u64(clsOff + 24)
         let roVM = bits & 0x00007FFFFFFFFFF8
         guard let roOff = fileOffset(roVM) else { return "" }
@@ -190,9 +208,9 @@ final class ObjCDumper {
     // MARK: - method_list_t
 
     private func readMethods(listVM: UInt64, classMethod: Bool) -> [ObjCMethodDump] {
-        guard listVM > 0, let listOff = fileOffset(listVM) else { return [] }
-        let hdr = u32(listOff)
-        let count = u32(listOff + 4)
+        guard listVM > 0, listVM <= UInt64(Int.max), let listOff = fileOffset(listVM),
+              Int(listOff) >= 0, Int(listOff) + 8 <= bin.count else { return [] }
+        guard let hdr = u32s(listOff), let count = u32s(listOff + 4) else { return [] }
         guard count > 0, count < 20000 else { return [] }
         var out: [ObjCMethodDump] = []
         out.reserveCapacity(Int(count))
@@ -204,6 +222,7 @@ final class ObjCDumper {
             if relative {
                 let entryOff = listOff + 8 + UInt64(i) * 12
                 let entryVM = listVM + 8 + UInt64(i) * 12
+                guard Int(entryOff) + 12 <= bin.count else { break }
                 let nameOff = i32(entryOff)
                 let typeOff = i32(entryOff + 4)
                 let impOff = i32(entryOff + 8)
@@ -217,6 +236,7 @@ final class ObjCDumper {
                 let entSize = Int(hdr & 0x7FFFFFFF)
                 let es = entSize >= 24 ? entSize : 24
                 let entryOff = listOff + 8 + UInt64(i) * UInt64(es)
+                guard Int(entryOff) + 24 <= bin.count else { break }
                 if let nf = fileOffset(u64(entryOff)) { selName = cstr(nf) }
                 if let tf = fileOffset(u64(entryOff + 8)) { typeEnc = cstr(tf, 256) }
                 imp = u64(entryOff + 16)
@@ -232,9 +252,9 @@ final class ObjCDumper {
     // MARK: - ivar_list_t
 
     private func readIvars(listVM: UInt64) -> [ObjCIvarDump] {
-        guard listVM > 0, let listOff = fileOffset(listVM) else { return [] }
-        let hdr = u32(listOff)
-        let count = u32(listOff + 4)
+        guard listVM > 0, listVM <= UInt64(Int.max), let listOff = fileOffset(listVM),
+              Int(listOff) >= 0, Int(listOff) + 8 <= bin.count else { return [] }
+        guard let hdr = u32s(listOff), let count = u32s(listOff + 4) else { return [] }
         guard count > 0, count < 1000 else { return [] }
         var out: [ObjCIvarDump] = []
         let relative = (hdr & 0x80000000) != 0
@@ -245,12 +265,14 @@ final class ObjCDumper {
                 // relative ivar entry: 4×int32（offset/name/type/...）
                 let entryVM = listVM + 8 + UInt64(i) * 16
                 let entryOff = listOff + 8 + UInt64(i) * 16
+                guard Int(entryOff) + 16 <= bin.count else { break }
                 let nameVM = UInt64(bitPattern: Int64(entryVM) + Int64(i32(entryOff + 4)))
                 let typeVM = UInt64(bitPattern: Int64(entryVM) + Int64(i32(entryOff + 8)))
                 if let nf = fileOffset(nameVM) { name = cstr(nf) }
                 if let tf = fileOffset(typeVM) { type = cstr(tf, 128) }
             } else {
                 let entryOff = listOff + 8 + UInt64(i) * 32
+                guard Int(entryOff) + 32 <= bin.count else { break }
                 if let nf = fileOffset(u64(entryOff + 8)) { name = cstr(nf) }
                 if let tf = fileOffset(u64(entryOff + 16)) { type = cstr(tf, 128) }
             }
@@ -264,9 +286,9 @@ final class ObjCDumper {
     // MARK: - property_list_t
 
     private func readProps(listVM: UInt64) -> [ObjCPropDump] {
-        guard listVM > 0, let listOff = fileOffset(listVM) else { return [] }
-        let hdr = u32(listOff)
-        let count = u32(listOff + 4)
+        guard listVM > 0, listVM <= UInt64(Int.max), let listOff = fileOffset(listVM),
+              Int(listOff) >= 0, Int(listOff) + 8 <= bin.count else { return [] }
+        guard let hdr = u32s(listOff), let count = u32s(listOff + 4) else { return [] }
         guard count > 0, count < 1000 else { return [] }
         var out: [ObjCPropDump] = []
         let relative = (hdr & 0x80000000) != 0
@@ -276,12 +298,14 @@ final class ObjCDumper {
             if relative {
                 let entryVM = listVM + 8 + UInt64(i) * 8
                 let entryOff = listOff + 8 + UInt64(i) * 8
+                guard Int(entryOff) + 8 <= bin.count else { break }
                 let nameVM = UInt64(bitPattern: Int64(entryVM) + Int64(i32(entryOff)))
                 let attrVM = UInt64(bitPattern: Int64(entryVM) + Int64(i32(entryOff + 4)))
                 if let nf = fileOffset(nameVM) { name = cstr(nf) }
                 if let af = fileOffset(attrVM) { attr = cstr(af, 256) }
             } else {
                 let entryOff = listOff + 8 + UInt64(i) * 16
+                guard Int(entryOff) + 16 <= bin.count else { break }
                 if let nf = fileOffset(u64(entryOff)) { name = cstr(nf) }
                 if let af = fileOffset(u64(entryOff + 8)) { attr = cstr(af, 256) }
             }
