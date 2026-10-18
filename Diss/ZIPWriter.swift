@@ -20,7 +20,7 @@ enum ZIPWriter {
 
     /// 流式打包到磁盘文件。store 条目分块两遍（先 crc 后写），deflate 解压后写。
     /// 全部字段为真实值（与 write 完全同构），兼容性 100%。
-    static func writeStreaming(_ items: [StreamItem], to url: URL,
+    static func writeStreaming(_ items: [StreamItem], reader: ZipReader?, to url: URL,
                                progress: @escaping (Int, Int) -> Void) -> Bool {
         FileManager.default.createFile(atPath: url.path, contents: nil)
         guard let fh = try? FileHandle(forWritingTo: url) else { return false }

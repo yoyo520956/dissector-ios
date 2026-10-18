@@ -155,7 +155,7 @@ enum ExportKit {
 
         // 打包：流式落盘（恒定内存）
         progress("打包写入", 0, items.count)
-        let ok = ZIPWriter.writeStreaming(items, to: out) { i, n in
+        let ok = ZIPWriter.writeStreaming(items, reader: reader, to: out) { i, n in
             progress("打包写入", i, max(n, 1))
         }
         guard ok else { return nil }
