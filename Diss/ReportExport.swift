@@ -7,12 +7,12 @@ import Foundation
 enum ReportExport {
 
     static func esc(_ s: String) -> String {
-        s.replacingOccurrences(of: "<", with: "<")
-            .replacingOccurrences(of: ">", with: ">")
-            .replacingOccurrences(of: "&", with: "&")
+        s.replacingOccurrences(of: "&", with: "\u{26}amp;")
+            .replacingOccurrences(of: "<", with: "\u{26}lt;")
+            .replacingOccurrences(of: ">", with: "\u{26}gt;")
     }
 
-    static func build(engine: AnalysisEngine) -> String {
+    @MainActor static func build(engine: AnalysisEngine) -> String {
         let r = engine.result
         var h = """
         <!DOCTYPE html><html><head><meta charset="utf-8">
@@ -88,14 +88,14 @@ enum ReportExport {
         // ⑥ 字符串（前 200）
         h += "<h2>⑥ 字符串样本（前 200 / 共 \(r.cstrings.count)）</h2><div class='card'>"
         for s in r.cstrings.prefix(200) {
-            h += "<code>\(esc(s.prefix(120)))</code> "
+            h += "<code>\(esc(String(s.prefix(120))))</code> "
         }
         h += "</div>"
 
         // ⑦ 网络
         let net = NetworkExtract.extract(r.cstrings)
         h += "<h2>⑦ 网络接口（URL \(net.urls.count) / Host \(net.hosts.count)）</h2><div class='card'>"
-        for u in net.urls.prefix(80) { h += "<code>\(esc(u.text))</code><br>" }
+        for u in net.urls.prefix(80) { h += "<code>\(esc(String(u.text)))</code><br>" }
         h += "</div>"
 
         // ⑧ 风控
