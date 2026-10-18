@@ -335,6 +335,9 @@ final class AnalysisEngine: ObservableObject {
 
     private var classDumpCache: [ObjCClassDump]?
 
+    /// 预热缓存只读直通（不触发计算）
+    var cachedClassesIfReady: [ObjCClassDump]? { classDumpCache }
+
     func dumpClasses() -> [ObjCClassDump] {
         if let c = classDumpCache { return c }
         guard !binData.isEmpty, !warming else { return [] }   // 预热中不重复跑，UI 等翻转自动刷新
@@ -552,15 +555,18 @@ final class AnalysisEngine: ObservableObject {
         let snap = ExportKit.Snapshot(fileName: fileName, url: z.fileURLForExport,
                                       bin: binData, segments: result.segments,
                                       sections: result.allSections, entries: result.entries,
-                                      appFolder: result.appFolder, result: result)
+                                      appFolder: result.appFolder, result: result,
+                                      classes: cachedClassesIfReady)
         exportState = "准备打包…"
         exportZipURL = nil
+        let start = Date()
         Task.detached(priority: .userInitiated) { [weak self] in
             let dir = AnalysisEngine.exportsDir()
             let tmp = dir.appendingPathComponent("export-\(UUID().uuidString.prefix(6)).zip")
             let skipped = ExportKit.buildProjectToFile(snap, to: tmp) { phase, done, total in
                 Task { @MainActor [weak self] in
-                    self?.exportState = "\(phase) \(done)/\(total)"
+                    let sec = Int(Date().timeIntervalSince(start))
+                    self?.exportState = "\(phase)\(total > 0 ? " \(done)/\(total)" : "") · \(sec)s"
                 }
             }
             await MainActor.run {

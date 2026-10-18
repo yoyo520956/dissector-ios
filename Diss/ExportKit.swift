@@ -24,6 +24,7 @@ enum ExportKit {
         let entries: [ZipEntry]
         let appFolder: String
         let result: AnalysisResult
+        let classes: [ObjCClassDump]?   // 预热缓存直通（nil 则现场 dump）
     }
 
     /// 流式落盘版：恒定内存（≤30MB 峰值），素材总量上限 300MB。返回 skipped 数。
@@ -48,6 +49,9 @@ enum ExportKit {
             guard totalBytes + Int(e.size) <= maxTotal else { skipped += 1; return false }
             totalBytes += Int(e.size)
             items.append(ZIPWriter.StreamItem(path: path, data: nil, entry: e))
+            if totalBytes / (8 * 1024 * 1024) != (totalBytes - Int(e.size)) / (8 * 1024 * 1024) {
+                progress("收集素材 \(totalBytes / 1024 / 1024)MB", 0, 0)
+            }
             return true
         }
 
@@ -80,10 +84,15 @@ enum ExportKit {
         """
         _ = add("README.txt", Data(readme.utf8))
 
-        // ② 类头文件
-        progress("导出类转储", 0, 1)
-        let dumper = ObjCDumper(data: s.bin, segments: s.segments, sections: s.sections)
-        let classes = dumper.dump()
+        // ② 类头文件（优先复用引擎预热缓存——省 30~60s）
+        let classes: [ObjCClassDump]
+        if let pre = s.classes, !pre.isEmpty {
+            classes = pre
+        } else {
+            progress("类转储分析中（大文件约需 1 分钟）", 0, 1)
+            let dumper = ObjCDumper(data: s.bin, segments: s.segments, sections: s.sections)
+            classes = dumper.dump()
+        }
         for (i, c) in classes.enumerated() {
             let h = ObjCDumper.headerText([c])
             _ = add("classes/\(c.name).h", Data(h.utf8))
@@ -154,9 +163,19 @@ enum ExportKit {
         progress("导出 UI 与资源", s.entries.count, s.entries.count)
 
         // 打包：流式落盘（恒定内存）
-        progress("打包写入", 0, items.count)
+        progress("打包写入 0/\(totalBytes / 1024 / 1024)MB", 0, 1)
+        var lastMB = 0
+        var written = 0
         let ok = ZIPWriter.writeStreaming(items, reader: reader, to: out) { i, n in
-            progress("打包写入", i, max(n, 1))
+            written = i
+            if i % 24 == 0 || i == n {
+                // 按条目比例折算字节
+                let mb = totalBytes * i / max(n, 1) / 1024 / 1024
+                if mb != lastMB || i == n {
+                    lastMB = mb
+                    progress("打包写入 \(mb)/\(totalBytes / 1024 / 1024)MB", i, max(n, 1))
+                }
+            }
         }
         guard ok else { return nil }
         return skipped
