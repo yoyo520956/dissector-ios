@@ -1,5 +1,5 @@
 import Foundation
-import Compression
+import zlib
 
 // 零依赖 ZIP 读取器：
 // 只解析 EOCD + central directory，按需解压单条目（Compression raw deflate）。
@@ -158,47 +158,46 @@ final class ZipReader {
     }
 
     static func inflate(_ src: Data, outSize: Int) throws -> Data {
-        // 模式 1：标准 zip 的 raw deflate
-        if let d = try? inflateRaw(src, outSize: outSize), d.count == outSize {
+        // 模式 1：标准 zip 的 raw deflate（windowBits -15）
+        if let d = try? zlibInflate(src, outSize: outSize, windowBits: -15), d.count == outSize {
             return d
         }
-        // 模式 2：非标打包器的 zlib 包裹格式（2 字节头 + adler32 尾）
-        if src.count > 6, let d = try? inflateRaw(src.subdata(in: 2..<(src.count - 4)), outSize: outSize),
-           d.count == outSize {
+        // 模式 2：zlib 包裹格式（windowBits 15，自动处理 2 字节头 + adler32 尾）
+        if let d = try? zlibInflate(src, outSize: outSize, windowBits: 15), d.count == outSize {
             return d
         }
-        throw IPAError.unsupported("deflate 解压失败（raw/zlib 双模式均失败，packed=\(src.count) 期望输出 \(outSize)）")
+        throw IPAError.unsupported("deflate 解压失败（libz raw/zlib 双模式均失败，packed=\(src.count) 期望输出 \(outSize)）")
     }
 
-    private static func inflateRaw(_ src: Data, outSize: Int) throws -> Data {
-        // 流式解压（compression_stream）：比 decode_buffer 可靠，不会静默提前返回
+    /// libz 标准解压（iOS 系统自带 /usr/lib/libz，行为与所有 zip 工具一致）
+    /// windowBits: -15 = raw deflate（zip 标准），15 = zlib wrapped
+    private static func zlibInflate(_ src: Data, outSize: Int, windowBits: Int32) throws -> Data {
         var dst = Data(count: outSize)
         var produced = 0
-        let status = dst.withUnsafeMutableBytes { (db: UnsafeMutableRawBufferPointer) -> compression_status in
-            src.withUnsafeBytes { (sb: UnsafeRawBufferPointer) -> compression_status in
-                guard let dp = db.bindMemory(to: UInt8.self).baseAddress,
-                      let sp = sb.bindMemory(to: UInt8.self).baseAddress else { return COMPRESSION_STATUS_ERROR }
-                var stream = compression_stream(dst_ptr: dp, dst_size: outSize,
-                                                src_ptr: sp, src_size: src.count, state: nil)
-                guard compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB) == COMPRESSION_STATUS_OK else {
-                    return COMPRESSION_STATUS_ERROR
+        var ret: Int32 = 0
+        dst.withUnsafeMutableBytes { (db: UnsafeMutableRawBufferPointer) in
+            src.withUnsafeBytes { (sb: UnsafeRawBufferPointer) in
+                guard let dp = db.bindMemory(to: Bytef.self).baseAddress,
+                      let sp = sb.bindMemory(to: Bytef.self).baseAddress else {
+                    ret = -100
+                    return
                 }
-                defer { compression_stream_destroy(&stream) }
-                let finalize = Int32(COMPRESSION_STREAM_FINALIZE.rawValue)
-                var st: compression_status = COMPRESSION_STATUS_OK
-                while true {
-                    st = compression_stream_process(&stream, finalize)
-                    if st == COMPRESSION_STATUS_ERROR { return COMPRESSION_STATUS_ERROR }
-                    if st == COMPRESSION_STATUS_END { break }
-                    if stream.dst_size == 0 { break }   // 输出缓冲已满
-                    if stream.src_size == 0 { break }   // 输入耗尽（防死循环，产出校验交给外层）
+                var zs = z_stream()
+                guard inflateInit2_(&zs, windowBits, nil, Int32(MemoryLayout<z_stream>.size)) == Z_OK else {
+                    ret = -101
+                    return
                 }
-                produced = outSize - Int(stream.dst_size)
-                return st
+                defer { inflateEnd(&zs) }
+                zs.next_in = UnsafeMutablePointer<Bytef>(mutating: sp)
+                zs.avail_in = uInt(src.count)
+                zs.next_out = dp
+                zs.avail_out = uInt(outSize)
+                ret = inflate(&zs, Z_FINISH)
+                produced = outSize - Int(zs.avail_out)
             }
         }
-        guard status == COMPRESSION_STATUS_END else {
-            throw IPAError.unsupported("raw deflate 流式失败")
+        guard ret == Z_STREAM_END || ret == Z_OK else {
+            throw IPAError.unsupported("libz inflate 失败（windowBits=\(windowBits) ret=\(ret) 产出 \(produced)/\(outSize)）")
         }
         guard produced == outSize else {
             throw IPAError.notZip("解压产出不足（\(produced)/\(outSize)）")
