@@ -1,4 +1,5 @@
 import Foundation
+import zlib
 
 // MARK: - 轻量 ZIP 写入器（零依赖，store 模式）
 // 用于把选中的资源打包成 .zip 导出。store 模式不压缩但 100% 兼容。
