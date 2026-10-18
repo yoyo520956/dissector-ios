@@ -189,13 +189,8 @@ final class AnalysisEngine: ObservableObject {
         let tmpDir = Self.tmpDir()
         let mainBinURL = tmpDir.appendingPathComponent("main.bin")
         try? FileManager.default.removeItem(at: mainBinURL)
-        var lastMB = 0
         let extracted = try zr.extractTo(binEntry, to: mainBinURL) { done, _ in
-            let mb = done / (16 * 1024 * 1024)
-            if mb != lastMB {
-                lastMB = mb
-                Task { @MainActor in self.progress("解压主二进制… \(mb * 16)MB") }
-            }
+            progress("解压主二进制… \(done / 1024 / 1024)MB")
         }
         guard extracted == Int(binEntry.size) else {
             throw IPAError.notZip("主二进制解压不完整（\(extracted)/\(binEntry.size)）")

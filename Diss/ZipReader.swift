@@ -238,11 +238,13 @@ final class ZipReader {
             throw IPAError.notZip("临时文件创建失败")
         }
         defer { try? fh.close() }
-        var total = 0
         let cb = { (chunk: Data) in
             try? fh.write(contentsOf: chunk)
             total += chunk.count
-            progress?(total, Int(entry.size))
+            // 节流：每 8MB 或末块回调（避免大文件数千次回调）
+            if total / (8 * 1024 * 1024) != (total - chunk.count) / (8 * 1024 * 1024) || total == Int(entry.size) {
+                progress?(total, Int(entry.size))
+            }
         }
         try streamBytes(for: entry, sink: cb)
         return total
