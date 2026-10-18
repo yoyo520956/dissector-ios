@@ -176,8 +176,56 @@ final class ZipReader {
                 remaining -= n
             }
         } else {
-            let comp = try readFull(fh, Int(entry.packed))
-            sink(try Self.inflate(comp, outSize: Int(entry.size)))
+            // zlib 流式解压（跨块状态）——任意大小文件恒定内存
+            var zs = z_stream()
+            let initSt = inflateInit2_(&zs, -15, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
+            guard initSt == Z_OK else { throw IPAError.notZip("inflate 初始化失败") }
+            defer { inflateEnd(&zs) }
+            var inBuf = Data()
+            let outCap = 1 << 18
+            var outBuf = [UInt8](repeating: 0, count: outCap)
+            var remaining = Int(entry.packed)
+            var produced = 0
+            var done = false
+            while !done {
+                if remaining > 0 && zs.avail_in == 0 {
+                    inBuf = try readFull(fh, min(remaining, chunk))
+                    remaining -= inBuf.count
+                    let n = inBuf.count
+                    inBuf.withUnsafeBytes { sb in
+                        if let base = sb.bindMemory(to: Bytef.self).baseAddress {
+                            zs.next_in = UnsafeMutablePointer<Bytef>(mutating: base)
+                            zs.avail_in = uInt(n)
+                        }
+                    }
+                }
+                if zs.avail_in == 0 && remaining == 0 && produced == 0 {
+                    // 无输入且无输出：数据异常，避免死循环
+                    break
+                }
+                var wrote = 0
+                outBuf.withUnsafeMutableBufferPointer { ob in
+                    zs.next_out = ob.baseAddress
+                    zs.avail_out = uInt(ob.count)
+                    let st = zlib.inflate(&zs, Z_NO_FLUSH)
+                    wrote = ob.count - Int(zs.avail_out)
+                    if st == Z_STREAM_END { done = true }
+                    else if st != Z_OK && st != Z_BUF_ERROR {
+                        done = true
+                        produced = -1
+                    }
+                }
+                if produced < 0 { throw IPAError.notZip("流式解压失败: \(entry.path)") }
+                if wrote > 0 {
+                    produced += wrote
+                    sink(Data(bytes: outBuf, count: wrote))
+                } else if remaining == 0 && zs.avail_in == 0 {
+                    done = true   // 输入耗尽且无输出
+                }
+            }
+            guard produced == Int(entry.size) else {
+                throw IPAError.notZip("流式解压不完整: \(entry.path)（\(produced)/\(entry.size)）")
+            }
         }
     }
 

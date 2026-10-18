@@ -27,29 +27,27 @@ enum ExportKit {
         let classes: [ObjCClassDump]?   // 预热缓存直通（nil 则现场 dump）
     }
 
-    /// 流式落盘版：恒定内存（≤30MB 峰值），素材总量上限 300MB。返回 skipped 数。
+    /// 流式落盘版：恒定内存（≤30MB 峰值），无大小限制（ZIP32 边界 ≈4GB）。返回 skipped 数。
     @discardableResult
     static func buildProjectToFile(_ s: Snapshot, to out: URL,
                                    progress: @escaping @Sendable (String, Int, Int) -> Void) -> Int? {
         var items: [ZIPWriter.StreamItem] = []
         var skipped = 0
         var totalBytes = 0
-        let maxTotal = 300 * 1024 * 1024
-        let maxFile = 24 * 1024 * 1024
+        // 无大小限制（流式写入恒定内存）；唯一硬边界 = ZIP32 格式 ≈4GB
+        let zip32Limit = 0xFFFFF000
 
         func add(_ path: String, _ data: Data, countIt: Bool = true) -> Bool {
-            guard data.count <= maxFile else { skipped += 1; return false }
-            guard totalBytes + data.count <= maxTotal else { skipped += 1; return false }
+            guard data.count <= zip32Limit else { skipped += 1; return false }
             items.append(ZIPWriter.StreamItem(path: path, data: data, entry: nil))
             if countIt { totalBytes += data.count }
             return true
         }
         func addEntry(_ path: String, _ e: ZipEntry) -> Bool {
-            guard !e.isDirectory, Int(e.size) <= maxFile else { if !e.isDirectory { skipped += 1 }; return false }
-            guard totalBytes + Int(e.size) <= maxTotal else { skipped += 1; return false }
+            guard !e.isDirectory, Int(e.size) <= zip32Limit else { if !e.isDirectory { skipped += 1 }; return false }
             totalBytes += Int(e.size)
             items.append(ZIPWriter.StreamItem(path: path, data: nil, entry: e))
-            if totalBytes / (8 * 1024 * 1024) != (totalBytes - Int(e.size)) / (8 * 1024 * 1024) {
+            if totalBytes / (64 * 1024 * 1024) != (totalBytes - Int(e.size)) / (64 * 1024 * 1024) {
                 progress("收集素材 \(totalBytes / 1024 / 1024)MB", 0, 0)
             }
             return true
@@ -139,7 +137,7 @@ enum ExportKit {
 
             // metadata：小文件读入（保 CRC 终检）
             if rel == "Info.plist" || rel == "embedded.mobileprovision" || base == "PkgInfo" {
-                if let d = try? reader.data(for: e, maxBytes: maxFile) { _ = add("metadata/\(base)", d) }
+                if let d = try? reader.data(for: e, maxBytes: 8 * 1024 * 1024) { _ = add("metadata/\(base)", d) }
                 else { skipped += 1 }
                 continue
             }
@@ -156,8 +154,7 @@ enum ExportKit {
             }
             // 跳过主二进制本身
             if rel == s.result.info.executable { continue }
-            // 其余资源：全部流式（dylib 跳过）
-            if rel.hasPrefix("Frameworks/") && (ext == "dylib" || ext == "a") { skipped += 1; continue }
+            // 其余资源：全部流式导出（dylib/framework 也保留，可供 Hopper/Ghidra 深分析）
             _ = addEntry("resources/\(rel)", e)
         }
         progress("导出 UI 与资源", s.entries.count, s.entries.count)
