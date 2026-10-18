@@ -23,6 +23,7 @@ enum XrefEngine {
         let len = Int(textSec.size)
         var graph: [UInt64: [XrefSite]] = [:]
         var count = 0
+        var totalSites = 0
         bin.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let p = raw.baseAddress else { return }
             var id = 0
@@ -35,11 +36,18 @@ enum XrefEngine {
                     var imm = Int32(w & 0x03FFFFFF)
                     // 符号扩展 26 位
                     if imm & 0x02000000 != 0 { imm |= -1 << 26 }
-                    let target = textSec.addr + UInt64(off) + UInt64(Int64(imm) * 4)
-                    let va = textSec.addr + UInt64(off)
-                    graph[target, default: []].append(XrefSite(id: id, fromVA: va,
-                                                               kind: op == 0x94000000 ? "bl" : "b"))
-                    id += 1
+                    // 全程 Int64 运算：负偏移转 UInt64 会回绕成天文数字，加法溢出 = trap 闪退
+                    let targetOff = Int64(off) + Int64(imm) * 4
+                    if targetOff >= 0, targetOff < Int64(len) {   // 跳出 __text 的目标不记录
+                        let target = textSec.addr + UInt64(targetOff)
+                        let va = textSec.addr + UInt64(off)
+                        if totalSites < 1_500_000 {   // 内存保护：调用点总量上限
+                            graph[target, default: []].append(XrefSite(id: id, fromVA: va,
+                                                                       kind: op == 0x94000000 ? "bl" : "b"))
+                            totalSites += 1
+                        }
+                        id += 1
+                    }
                 }
                 off += 4
                 count += 1

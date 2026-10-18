@@ -6,6 +6,16 @@ import Combine
 // → 本地文件直接读（无安全作用域问题）→ ZIP 目录 → 主二进制 → Mach-O 全解析
 // 反汇编 / 资源预览数据源也在引擎里
 
+// 后台分析产物包（analyzeCore → 主线程落地）
+struct AnalyzePack {
+    let zip: ZipReader
+    let binData: Data
+    let result: AnalysisResult
+    let callGraph: [UInt64: [XrefSite]]
+    let xrefStats: (targets: Int, sites: Int)
+    let funcMap: [UInt64: String]
+}
+
 @MainActor
 final class AnalysisEngine: ObservableObject {
     enum Phase: Equatable {
@@ -100,130 +110,145 @@ final class AnalysisEngine: ObservableObject {
     private func analyze(url: URL) async {
         do {
             phase = .working("读取 ZIP 目录…")
-            let z = try ZipReader(url: url)
-            zip = z
-
-            let zr = z
-            result.entries = zr.entries
-            result.totalUncompressed = zr.totalUncompressed
-
-            // 定位 Payload/*.app/（取一级 .app 目录，用 Info.plist 验证；大小写兼容）
-            phase = .working("定位 App 包…")
-            var appFolder = ""
-            var fallback = ""
-            for e in zr.entries {
-                guard !e.isDirectory else { continue }
-                let lower = e.path.lowercased()
-                guard lower.hasPrefix("payload/") else { continue }
-                let rest = e.path.dropFirst(8)   // "Payload/" 长度
-                let comps = rest.split(separator: "/", omittingEmptySubsequences: true)
-                guard comps.count >= 2, comps[0].lowercased().hasSuffix(".app") else { continue }
-                let candidate = "Payload/" + comps[0] + "/"
-                if zr.entry(candidate + "Info.plist") != nil {
-                    appFolder = candidate
-                    break
+            // 121MB 级二进制的全链路解析全部后台跑，绝不占主线程
+            let pack = try await Task.detached(priority: .userInitiated) { () -> AnalyzePack in
+                try Self.analyzeCore(url: url) { msg in
+                    Task { @MainActor [weak self] in self?.phase = .working(msg) }
                 }
-                if fallback.isEmpty { fallback = candidate }
-            }
-            if appFolder.isEmpty { appFolder = fallback }
-            guard !appFolder.isEmpty else { throw IPAError.notZip("包内未找到 Payload/*.app 目录") }
-            result.appFolder = appFolder
-
-            // Info.plist
-            phase = .working("读取 Info.plist…")
-            if let ip = zr.entry(appFolder + "Info.plist") {
-                let d = try zr.data(for: ip)
-                result.info = Extractors.appInfo(from: d)
-            }
-
-            // 主二进制
-            phase = .working("解压主二进制…")
-            let exeName = result.info.executable.isEmpty ? "主程序" : result.info.executable
-            let binPath = appFolder + exeName
-            guard let binEntry = zr.entry(binPath) else {
-                throw IPAError.noBinary("\(binPath)（查 Info.plist 的 CFBundleExecutable）")
-            }
-            binData = try zr.data(for: binEntry, maxBytes: 512 * 1024 * 1024)
-            guard binData.count == Int(binEntry.size) else {
-                throw IPAError.notZip("主二进制解压不完整（\(binData.count)/\(binEntry.size)）")
-            }
-            result.summary.fileSize = binEntry.size
-
-            // Mach-O
-            phase = .working("解析 Mach-O 结构…")
-            let parser = MachOParser(data: binData)
-            try parser.parse()
-            result.segments = parser.segments
-            result.allSections = parser.allSections
-            result.dylibs = parser.dylibs
-            result.summary.minOS = parser.summary.minOS
-            result.summary.sdkVersion = parser.summary.sdkVersion
-            result.summary.uuid = parser.summary.uuid
-            result.summary.encrypted = parser.summary.encrypted
-            result.summary.fileType = parser.summary.fileType
-            result.summary.format = parser.summary.format
-            result.summary.symbolCount = parser.summary.symbolCount
-            result.summary.dylibCount = parser.summary.dylibCount
-            result.symbols = parser.symbolsRaw
-
-            // 带地址符号 + __text 定位（反汇编用）
-            let textSec = parser.allSections.first { $0.segment == "__TEXT" && $0.name == "__text" }
-            result.textSection = textSec
-            var full = parser.symbolsFull
-            if let t = textSec {
-                for idx in full.indices {
-                    let s = full[idx]
-                    if s.value >= t.addr && s.value < t.addr + t.size {
-                        full[idx] = MachSymbol(id: s.id, name: s.name, value: s.value, kind: "func")
-                    }
-                }
-            }
-            result.symbolsFull = full
-            funcSymbolMap = [:]
-            for s in full where s.kind == "func" {
-                if funcSymbolMap[s.value] == nil { funcSymbolMap[s.value] = s.name }
-            }
-
-            // 交叉引用：bl/b 全字扫描建图（专业功能）
-            if let t = textSec {
-                let (g, n) = XrefEngine.buildCallGraph(bin: binData, textSec: t)
-                callGraph = g
-                xrefStats = (g.count, n)
-            }
-
-            // 字符串与 ObjC
-            phase = .working("提取类名与字符串…")
-            var strings: [String] = []
-            for sec in parser.allSections {
-                let nm = sec.name
-                guard nm == "__cstring" || nm == "__objc_classname" || nm == "__objc_methname" else { continue }
-                let d = parser.sectionData(sec, from: binData, limit: 8 * 1024 * 1024)
-                strings.append(contentsOf: Extractors.cStrings(from: d))
-            }
-            if result.summary.symbolCount > 0 {
-                strings.append(contentsOf: parser.symbolsRaw)
-            }
-            let objc = Extractors.objcNames(strings)
-            result.classNames = objc.classes
-            result.methodNames = objc.methods
-            result.cstrings = Array(Set(strings)).sorted()
-            result.summary.classCount = objc.classes.count
-            result.summary.methodCount = objc.methods.count
-
-            // Swift 符号还原
-            result.swiftSymbols = SwiftDemangle.demangleList(result.cstrings)
-
-            // 描述文件
-            phase = .working("读取描述文件…")
-            if let mp = zr.entry(appFolder + "embedded.mobileprovision") {
-                let raw = try zr.data(for: mp)
-                result.provision = Extractors.provision(from: raw)
-            }
-
+            }.value
+            zip = pack.zip
+            binData = pack.binData
+            result = pack.result
+            callGraph = pack.callGraph
+            xrefStats = pack.xrefStats
+            funcSymbolMap = pack.funcMap
             phase = .done
         } catch {
             phase = .failed(error.localizedDescription)
         }
+    }
+
+    nonisolated private static func analyzeCore(url: URL, progress: @escaping @Sendable (String) -> Void) throws -> AnalyzePack {
+        progress("读取 ZIP 目录…")
+        let z = try ZipReader(url: url)
+        let zr = z
+        let result = AnalysisResult()
+        result.entries = zr.entries
+        result.totalUncompressed = zr.totalUncompressed
+
+        // 定位 Payload/*.app/（一级 .app + Info.plist 验证；大小写兼容）
+        progress("定位 App 包…")
+        var appFolder = ""
+        var fallback = ""
+        for e in zr.entries {
+            guard !e.isDirectory else { continue }
+            let lower = e.path.lowercased()
+            guard lower.hasPrefix("payload/") else { continue }
+            let rest = e.path.dropFirst(8)
+            let comps = rest.split(separator: "/", omittingEmptySubsequences: true)
+            guard comps.count >= 2, comps[0].lowercased().hasSuffix(".app") else { continue }
+            let candidate = "Payload/" + comps[0] + "/"
+            if zr.entry(candidate + "Info.plist") != nil {
+                appFolder = candidate
+                break
+            }
+            if fallback.isEmpty { fallback = candidate }
+        }
+        if appFolder.isEmpty { appFolder = fallback }
+        guard !appFolder.isEmpty else { throw IPAError.notZip("包内未找到 Payload/*.app 目录") }
+        result.appFolder = appFolder
+
+        progress("读取 Info.plist…")
+        if let ip = zr.entry(appFolder + "Info.plist") {
+            let d = try zr.data(for: ip)
+            result.info = Extractors.appInfo(from: d)
+        }
+
+        progress("解压主二进制…")
+        let exeName = result.info.executable.isEmpty ? "主程序" : result.info.executable
+        let binPath = appFolder + exeName
+        guard let binEntry = zr.entry(binPath) else {
+            throw IPAError.noBinary("\(binPath)（查 Info.plist 的 CFBundleExecutable）")
+        }
+        let binData = try zr.data(for: binEntry, maxBytes: 512 * 1024 * 1024)
+        guard binData.count == Int(binEntry.size) else {
+            throw IPAError.notZip("主二进制解压不完整（\(binData.count)/\(binEntry.size)）")
+        }
+        result.summary.fileSize = binEntry.size
+
+        progress("解析 Mach-O 结构…")
+        let parser = MachOParser(data: binData)
+        try parser.parse()
+        result.segments = parser.segments
+        result.allSections = parser.allSections
+        result.dylibs = parser.dylibs
+        result.summary.minOS = parser.summary.minOS
+        result.summary.sdkVersion = parser.summary.sdkVersion
+        result.summary.uuid = parser.summary.uuid
+        result.summary.encrypted = parser.summary.encrypted
+        result.summary.fileType = parser.summary.fileType
+        result.summary.format = parser.summary.format
+        result.summary.symbolCount = parser.summary.symbolCount
+        result.summary.dylibCount = parser.summary.dylibCount
+        result.symbols = parser.symbolsRaw
+
+        let textSec = parser.allSections.first { $0.segment == "__TEXT" && $0.name == "__text" }
+        result.textSection = textSec
+        var full = parser.symbolsFull
+        if let t = textSec {
+            for idx in full.indices {
+                let sy = full[idx]
+                if sy.value >= t.addr && sy.value < t.addr + t.size {
+                    full[idx] = MachSymbol(id: sy.id, name: sy.name, value: sy.value, kind: "func")
+                }
+            }
+        }
+        result.symbolsFull = full
+        var funcMap: [UInt64: String] = [:]
+        for sy in full where sy.kind == "func" {
+            if funcMap[sy.value] == nil { funcMap[sy.value] = sy.name }
+        }
+
+        progress("构建交叉引用图…")
+        var cg: [UInt64: [XrefSite]] = [:]
+        var st: (targets: Int, sites: Int) = (0, 0)
+        if let t = textSec {
+            let (g, n) = XrefEngine.buildCallGraph(bin: binData, textSec: t)
+            cg = g
+            st = (g.count, n)
+        }
+
+        progress("提取类名与字符串…")
+        var strings: [String] = []
+        for sec in parser.allSections {
+            let nm = sec.name
+            guard nm == "__cstring" || nm == "__objc_classname" || nm == "__objc_methname" else { continue }
+            let d = parser.sectionData(sec, from: binData, limit: 8 * 1024 * 1024)
+            strings.append(contentsOf: Extractors.cStrings(from: d))
+            if strings.count > 600_000 { break }   // 内存保护：超限停止收集
+        }
+        if result.summary.symbolCount > 0 {
+            strings.append(contentsOf: parser.symbolsRaw)
+        }
+        if strings.count > 900_000 { strings = Array(strings.prefix(900_000)) }
+        let objc = Extractors.objcNames(strings)
+        result.classNames = objc.classes
+        result.methodNames = objc.methods
+        result.cstrings = Array(Set(strings)).sorted()
+        result.summary.classCount = objc.classes.count
+        result.summary.methodCount = objc.methods.count
+
+        progress("还原 Swift 符号…")
+        result.swiftSymbols = SwiftDemangle.demangleList(result.cstrings)
+
+        progress("读取描述文件…")
+        if let mp = zr.entry(appFolder + "embedded.mobileprovision") {
+            let raw = try zr.data(for: mp)
+            result.provision = Extractors.provision(from: raw)
+        }
+
+        return AnalyzePack(zip: z, binData: binData, result: result,
+                           callGraph: cg, xrefStats: st, funcMap: funcMap)
     }
 
     // MARK: - 给详情页用的原始数据
