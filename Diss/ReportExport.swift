@@ -95,7 +95,7 @@ enum ReportExport {
         // ⑦ 网络
         let net = NetworkExtract.extract(r.cstrings)
         h += "<h2>⑦ 网络接口（URL \(net.urls.count) / Host \(net.hosts.count)）</h2><div class='card'>"
-        for u in net.urls.prefix(80) { h += "<code>\(esc(String(u.text)))</code><br>" }
+        for u in net.urls.prefix(80) { h += "<code>\(esc(u.value))</code><br>" }
         h += "</div>"
 
         // ⑧ 风控
