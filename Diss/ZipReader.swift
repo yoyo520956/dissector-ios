@@ -229,6 +229,25 @@ final class ZipReader {
         }
     }
 
+    /// 条目流式解压到磁盘文件（恒定内存，任意大小）
+    @discardableResult
+    func extractTo(_ entry: ZipEntry, to url: URL,
+                   progress: ((Int, Int) -> Void)? = nil) throws -> Int {
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        guard let fh = try? FileHandle(forWritingTo: url) else {
+            throw IPAError.notZip("临时文件创建失败")
+        }
+        defer { try? fh.close() }
+        var total = 0
+        let cb = { (chunk: Data) in
+            try? fh.write(contentsOf: chunk)
+            total += chunk.count
+            progress?(total, Int(entry.size))
+        }
+        try streamBytes(for: entry, sink: cb)
+        return total
+    }
+
     func md5Fingerprint() -> String {
         if let c = _md5Cache { return c }
         guard let d = try? Data(contentsOf: fileURL) else { return "无法读取" }
@@ -311,6 +330,16 @@ final class ZipReader {
         return dst
     }
 
+    static func u16(_ b: Data, _ o: Int) -> UInt16 {
+        UInt16(b[o]) | (UInt16(b[o+1]) << 8)
+    }
+    static func u32(_ b: Data, _ o: Int) -> UInt32 {
+        UInt32(b[o]) | (UInt32(b[o+1]) << 8) | (UInt32(b[o+2]) << 16) | (UInt32(b[o+3]) << 24)
+    }
+    static func u64(_ b: Data, _ o: Int) -> UInt64 {
+        UInt64(b[o]) | (UInt64(b[o+1]) << 8) | (UInt64(b[o+2]) << 16) | (UInt64(b[o+3]) << 24)
+            | (UInt64(b[o+4]) << 32) | (UInt64(b[o+5]) << 40) | (UInt64(b[o+6]) << 48) | (UInt64(b[o+7]) << 56)
+    }
     static func u16(_ b: [UInt8], _ o: Int) -> UInt16 {
         UInt16(b[o]) | (UInt16(b[o+1]) << 8)
     }

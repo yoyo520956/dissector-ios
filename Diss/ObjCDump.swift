@@ -39,14 +39,14 @@ struct ObjCClassDump: Identifiable, Hashable {
 // 相对方法列表（iOS14+ 默认）精确解析；绝对指针路径 + chained fixup 启发式兜底。
 
 final class ObjCDumper {
-    private let bin: [UInt8]
+    private let bin: Data
     private let segments: [MachSegment]
     private let sections: [MachSection]
     private var resolveCache: [UInt64: UInt64] = [:]
     private var textVM: UInt64
 
     init(data: Data, segments: [MachSegment], sections: [MachSection]) {
-        self.bin = [UInt8](data)
+        self.bin = data   // mmap 视图
         self.segments = segments
         self.sections = sections
         self.textVM = segments.first { $0.name == "__TEXT" }?.vmaddr ?? 0

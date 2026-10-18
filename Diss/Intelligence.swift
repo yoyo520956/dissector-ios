@@ -211,7 +211,7 @@ struct CodeSigInfo {
 enum CodeSigParser {
 
     // slice: arm64 thin slice 的完整字节
-    static func parse(slice: [UInt8]) -> CodeSigInfo {
+    static func parse(slice: Data) -> CodeSigInfo {
         var info = CodeSigInfo()
         func u32(_ o: Int) -> UInt32 {
             guard o >= 0, o + 4 <= slice.count else { return 0 }

@@ -179,17 +179,65 @@ final class AnalysisEngine: ObservableObject {
             result.info = Extractors.appInfo(from: d)
         }
 
-        progress("解压主二进制…")
+        // 主二进制：流式解压到临时文件 + mmap（无大小限制，内存恒定）
         let exeName = result.info.executable.isEmpty ? "主程序" : result.info.executable
         let binPath = appFolder + exeName
         guard let binEntry = zr.entry(binPath) else {
             throw IPAError.noBinary("\(binPath)（查 Info.plist 的 CFBundleExecutable）")
         }
-        let binData = try zr.data(for: binEntry, maxBytes: 512 * 1024 * 1024)
-        guard binData.count == Int(binEntry.size) else {
-            throw IPAError.notZip("主二进制解压不完整（\(binData.count)/\(binEntry.size)）")
+        progress("解压主二进制…（大文件约需 10~30 秒）")
+        let tmpDir = Self.tmpDir()
+        let mainBinURL = tmpDir.appendingPathComponent("main.bin")
+        try? FileManager.default.removeItem(at: mainBinURL)
+        var lastMB = 0
+        let extracted = try zr.extractTo(binEntry, to: mainBinURL) { done, _ in
+            let mb = done / (16 * 1024 * 1024)
+            if mb != lastMB {
+                lastMB = mb
+                Task { @MainActor in self.progress("解压主二进制… \(mb * 16)MB") }
+            }
         }
-        result.summary.fileSize = binEntry.size
+        guard extracted == Int(binEntry.size) else {
+            throw IPAError.notZip("主二进制解压不完整（\(extracted)/\(binEntry.size)）")
+        }
+        var binData = try Data(contentsOf: mainBinURL, options: .mappedIfSafe)
+
+        // fat 二进制 → 自动提取 arm64 切片（分块流式，恒定内存）
+        if binData.count > 12, ZipReader.u32(binData, 0) == 0xcafebabe {
+            let nfat = Int(Self.be32(binData, 4))
+            var armOff = 0
+            var armSize = 0
+            for i in 0..<min(nfat, 32) {
+                let o = 8 + i * 20
+                guard o + 20 <= binData.count else { break }
+                if Self.be32(binData, o) == 0x0100000C {   // CPU_TYPE_ARM64
+                    armOff = Int(Self.be32(binData, o + 8))
+                    armSize = Int(Self.be32(binData, o + 12))
+                    break
+                }
+            }
+            guard armSize > 0, armOff >= 0, armOff + armSize <= binData.count else {
+                throw IPAError.noBinary("fat 二进制中未找到 arm64 切片")
+            }
+            progress("提取 arm64 切片…（\(armSize / 1024 / 1024)MB）")
+            let sliceURL = tmpDir.appendingPathComponent("arm64.bin")
+            try? FileManager.default.removeItem(at: sliceURL)
+            FileManager.default.createFile(atPath: sliceURL.path, contents: nil)
+            let sfh = try FileHandle(forWritingTo: sliceURL)
+            let chunk = 1 << 20
+            var pos = armOff
+            while pos < armOff + armSize {
+                let end = min(pos + chunk, armOff + armSize)
+                sfh.write(Data(binData[pos..<end]))
+                pos = end
+            }
+            try sfh.close()
+            binData = try Data(contentsOf: sliceURL, options: .mappedIfSafe)
+        }
+        guard binData.count > 64, ZipReader.u32(binData, 0) == 0xfeedfacf else {
+            throw IPAError.noBinary("主二进制不是有效的 Mach-O（magic \(String(ZipReader.u32(binData, 0), radix: 16))）")
+        }
+        result.summary.fileSize = UInt64(binData.count)
 
         progress("解析 Mach-O 结构…")
         let parser = MachOParser(data: binData)
@@ -391,25 +439,9 @@ final class AnalysisEngine: ObservableObject {
     @Published var integrityProgress: (Int, Int) = (0, 0)
 
     func arm64SliceData() -> Data? {
-        // thin 直接返回；fat → 定位 arm64 entry 切片
-        let bytes = [UInt8](binData)
-        guard bytes.count > 12 else { return nil }
-        let magic = UInt32(bytes[0]) | (UInt32(bytes[1]) << 8) | (UInt32(bytes[2]) << 16) | (UInt32(bytes[3]) << 24)
-        if magic == 0xfeedfacf { return binData }
-        guard magic == 0xcafebabe || magic == 0xbebafeca else { return nil }
-        let nfat = Int(bytes[4]) << 24 | Int(bytes[5]) << 16 | Int(bytes[6]) << 8 | Int(bytes[7])
-        for i in 0..<min(nfat, 16) {
-            let o = 8 + i * 20
-            guard o + 20 <= bytes.count else { break }
-            let cpu = UInt32(bytes[o]) << 24 | UInt32(bytes[o+1]) << 16 | UInt32(bytes[o+2]) << 8 | UInt32(bytes[o+3])
-            if cpu == 0x0100000C {
-                let off = Int(bytes[o+8]) << 24 | Int(bytes[o+9]) << 16 | Int(bytes[o+10]) << 8 | Int(bytes[o+11])
-                let size = Int(bytes[o+12]) << 24 | Int(bytes[o+13]) << 16 | Int(bytes[o+14]) << 8 | Int(bytes[o+15])
-                guard off + size <= binData.count else { return nil }
-                return binData.subdata(in: off..<(off + size))
-            }
-        }
-        return nil
+        // 入口已保证 thin（fat 在 analyze 阶段自动提取），直接返回 mmap 视图
+        guard binData.count > 12, ZipReader.u32(binData, 0) == 0xfeedfacf else { return nil }
+        return binData
     }
 
     func runIntegrityCheck() async -> [IntegrityItem] {
@@ -447,7 +479,7 @@ final class AnalysisEngine: ObservableObject {
             i.errors.append("无法定位 arm64 slice")
             return i
         }
-        return CodeSigParser.parse(slice: [UInt8](slice))
+        return CodeSigParser.parse(slice: slice)   // mmap 零复制
     }
 
     // MARK: - 专业层 · Hex / VA 映射 / 标注名 / 调用者
@@ -593,6 +625,16 @@ final class AnalysisEngine: ObservableObject {
     }
 
     // MARK: - 导出（Documents/exports/）
+
+    nonisolated static func be32(_ b: Data, _ o: Int) -> UInt32 {
+        (UInt32(b[o]) << 24) | (UInt32(b[o+1]) << 16) | (UInt32(b[o+2]) << 8) | UInt32(b[o+3])
+    }
+
+    nonisolated static func tmpDir() -> URL {
+        let d = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("diss-tmp")
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }
 
     nonisolated static func exportsDir() -> URL {
         let dir = documentsDir().appendingPathComponent("exports", isDirectory: true)

@@ -17,12 +17,12 @@ struct SwiftTypeDump: Identifiable, Hashable {
 }
 
 final class SwiftMetaDumper {
-    private let bin: [UInt8]
+    private let bin: Data
     private let segments: [MachSegment]
     private let sections: [MachSection]
 
     init(data: Data, segments: [MachSegment], sections: [MachSection]) {
-        self.bin = [UInt8](data)
+        self.bin = data   // mmap 视图
         self.segments = segments
         self.sections = sections
     }

@@ -7,7 +7,7 @@ import Foundation
 final class MachOParser {
     static let MH_EXECUTE: UInt32 = 0x2
 
-    private let bytes: [UInt8]
+    private let bytes: Data   // mmap 视图（零复制）
     private var pos = 0
     private(set) var segments: [MachSegment] = []
     private(set) var allSections: [MachSection] = []
@@ -15,7 +15,7 @@ final class MachOParser {
     private(set) var summary = BinarySummary()
 
     init(data: Data) {
-        bytes = [UInt8](data)
+        bytes = data
     }
 
     // MARK: - 入口
@@ -53,7 +53,7 @@ final class MachOParser {
         let off = UInt64(Self.be32(bytes, o + 8))
         let size = UInt64(Self.be32(bytes, o + 12))
         guard off + size <= UInt64(bytes.count) else { throw IPAError.notZip("fat slice 越界") }
-        let sub = Array(bytes[Int(off)..<Int(off + size)])
+        let sub = bytes.subdata(in: Int(off)..<Int(off + size))   // Data 切片共享存储
         guard sub.count > 64, ZipReader.u32(sub, 0) == 0xfeedfacf else {
             throw IPAError.notZip("fat 内非 64 位 Mach-O")
         }
@@ -63,7 +63,7 @@ final class MachOParser {
 
     // MARK: - Header + Load Commands
 
-    private func parseHeader(base: Int, bytes input: [UInt8]? = nil) throws {
+    private func parseHeader(base: Int, bytes input: Data? = nil) throws {
         let b = input ?? bytes
         let cputype = ZipReader.u32(b, base + 4)
         let filetype = ZipReader.u32(b, base + 12)
@@ -116,7 +116,7 @@ final class MachOParser {
 
     // MARK: - Segment / Section
 
-    private func readSegment(_ b: [UInt8], _ p: Int, _ secIdx: inout Int, _ segIdx: Int) -> MachSegment {
+    private func readSegment(_ b: Data, _ p: Int, _ secIdx: inout Int, _ segIdx: Int) -> MachSegment {
         let segName = cstr(b, p + 8, 16)
         let vmaddr = ZipReader.u64(b, p + 16)
         let vmSize = ZipReader.u64(b, p + 24)
@@ -146,7 +146,7 @@ final class MachOParser {
 
     // MARK: - Symbol Table
 
-    private func readSymtab(_ b: [UInt8], _ p: Int) {
+    private func readSymtab(_ b: Data, _ p: Int) {
         let symoff = Int(ZipReader.u32(b, p + 8))
         let nsyms = Int(ZipReader.u32(b, p + 12))
         let stroff = Int(ZipReader.u32(b, p + 16))
@@ -189,7 +189,7 @@ final class MachOParser {
 
     // MARK: - Dylib
 
-    private func readDylib(_ b: [UInt8], _ p: Int, _ weak: Bool) {
+    private func readDylib(_ b: Data, _ p: Int, _ weak: Bool) {
         let nameOff = Int(ZipReader.u32(b, p + 8))
         guard nameOff > 0, p + nameOff < b.count else { return }
         let path = cstr(b, p + nameOff, 1024)
@@ -199,7 +199,7 @@ final class MachOParser {
 
     // MARK: - 工具
 
-    private func cstr(_ b: [UInt8], _ off: Int, _ maxLen: Int) -> String {
+    private func cstr(_ b: Data, _ off: Int, _ maxLen: Int) -> String {
         guard off >= 0, off < b.count else { return "" }
         var e = off
         let end = min(b.count, off + maxLen)
@@ -209,7 +209,7 @@ final class MachOParser {
             ?? ""
     }
 
-    static func be32(_ b: [UInt8], _ o: Int) -> UInt32 {
+    static func be32(_ b: Data, _ o: Int) -> UInt32 {
         (UInt32(b[o]) << 24) | (UInt32(b[o+1]) << 16) | (UInt32(b[o+2]) << 8) | UInt32(b[o+3])
     }
 
