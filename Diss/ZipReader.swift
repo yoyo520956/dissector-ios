@@ -188,15 +188,17 @@ final class ZipReader {
     }
 
     static func inflate(_ src: Data, outSize: Int) throws -> Data {
-        // 模式 1：标准 zip 的 raw deflate（windowBits -15）
-        if let d = try? zlibInflate(src, outSize: outSize, windowBits: -15), d.count == outSize {
-            return d
+        // 主路：纯 Swift RFC1951 解码器（零系统依赖，python 侧已验证算法）
+        do {
+            let arr = try SwiftInflate.inflate([UInt8](src), outSize: outSize)
+            return Data(arr)
+        } catch {
+            // 备路：libz raw（万一大流路径有性能之外的差异）
+            if let d = try? zlibInflate(src, outSize: outSize, windowBits: -15), d.count == outSize {
+                return d
+            }
+            throw IPAError.unsupported("deflate 解压失败（SwiftInflate: \(error)｜libz 亦失败）packed=\(src.count) 期望输出 \(outSize)")
         }
-        // 模式 2：zlib 包裹格式（windowBits 15，自动处理 2 字节头 + adler32 尾）
-        if let d = try? zlibInflate(src, outSize: outSize, windowBits: 15), d.count == outSize {
-            return d
-        }
-        throw IPAError.unsupported("deflate 解压失败（libz raw/zlib 双模式均失败，packed=\(src.count) 期望输出 \(outSize)）")
     }
 
     /// libz 标准解压（iOS 系统自带 /usr/lib/libz，行为与所有 zip 工具一致）
