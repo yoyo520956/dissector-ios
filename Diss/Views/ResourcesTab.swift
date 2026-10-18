@@ -119,9 +119,9 @@ struct ResourceListView: View {
                 ToolbarItem(placement: .bottomBar) {
                     HStack {
                         Button {
-                            selection = Set(items.map { $0.id })
+                            selection = Set(displayItems.map { $0.id })
                         } label: {
-                            Text("全选本页(\(items.count))")
+                            Text("全选本页(\(displayItems.count))")
                         }
                         Spacer()
                         Button {
@@ -185,7 +185,7 @@ struct ResourceListView: View {
     }
 
     private func exportSelected() {
-        let chosen = items.filter { selection.contains($0.id) }
+        let chosen = displayItems.filter { selection.contains($0.id) }
         guard !chosen.isEmpty else { return }
         let base = (engine.result.info.displayName.isEmpty ? engine.fileName : engine.result.info.displayName)
             .replacingOccurrences(of: ".ipa", with: "")
