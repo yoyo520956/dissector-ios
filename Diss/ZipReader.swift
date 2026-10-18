@@ -14,8 +14,10 @@ final class ZipReader {
 
     init(url: URL) throws {
         fh = try FileHandle(forReadingFrom: url)
-        let attr = try FileManager.default.attributesOfItem(atPath: url.path)
-        fileSize = (attr[.size] as? NSNumber)?.uint64Value ?? 0
+        // 真实文件末尾：FileManager 属性会被 iCloud 占位文件欺骗，seekToEnd 永远可信
+        let endPos = try fh.seekToEnd()
+        fileSize = endPos
+        try fh.seek(toOffset: 0)
         try locateCentralDirectory()
     }
 
@@ -125,11 +127,27 @@ final class ZipReader {
             return comp
         }
         if entry.method == 8 {
-            let out = try Self.inflate(comp, outSize: Int(entry.size))
-            guard out.count == Int(entry.size) else {
-                throw IPAError.notZip("解压不完整: \(entry.path)（\(out.count)/\(entry.size)）——文件可能损坏")
+            do {
+                let out = try Self.inflate(comp, outSize: Int(entry.size))
+                // CRC32 终检：读位置错误/数据损坏在此现形
+                let got: UInt64 = comp.withUnsafeBytes { sb -> UInt64 in
+                    guard let sp = sb.bindMemory(to: Bytef.self).baseAddress else { return 0 }
+                    return UInt64(zlib.crc32(0, sp, uInt(comp.count)))
+                }
+                if got != UInt64(entry.crc) {
+                    throw IPAError.notZip("CRC 不匹配: \(entry.path)（算出 \(String(got, radix: 16)) 目录 \(String(entry.crc, radix: 16))）")
+                }
+                guard out.count == Int(entry.size) else {
+                    throw IPAError.notZip("解压不完整: \(entry.path)（\(out.count)/\(entry.size)）")
+                }
+                return out
+            } catch let e as IPAError {
+                throw e
+            } catch {
+                // 解压失败 → 全套诊断：读的位置 + 压缩数据指纹
+                let head = comp.prefix(8).map { String(format: "%02X", $0) }.joined(separator: " ")
+                throw IPAError.unsupported("\(error.localizedDescription)｜诊断: localOff=\(entry.offset) dataOff=\(dataOff) 前8字节=\(head)")
             }
-            return out
         }
         throw IPAError.unsupported("压缩方法 \(entry.method) 暂不支持（仅 store/deflate）: \(entry.path)（packed=\(entry.packed) size=\(entry.size) off=\(entry.offset)）")
     }
