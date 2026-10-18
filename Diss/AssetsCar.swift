@@ -96,6 +96,7 @@ enum AssetsCar {
 
     // 尝试解压 lzfse 块（供后续版本使用）
     static func tryLZFSE(_ data: Data, offset: UInt64) -> Data? {
+        guard offset <= UInt64(Int.max) else { return nil }
         let start = Int(offset)
         guard start < data.count else { return nil }
         let src = data.subdata(in: start..<min(data.count, start + 4 * 1024 * 1024))
