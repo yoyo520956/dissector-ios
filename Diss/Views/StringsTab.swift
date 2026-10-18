@@ -3,6 +3,17 @@ import SwiftUI
 struct StringsTab: View {
     @ObservedObject var engine: AnalysisEngine
     @State private var query = ""
+    @State private var displayRows: [StringItem] = []
+
+    private func recompute() async {
+        let q = query
+        try? await Task.sleep(nanoseconds: 220_000_000)
+        guard !Task.isCancelled, q == query else { return }
+        let all = engine.result.cstrings
+        displayRows = await Task.detached(priority: .userInitiated) {
+            Repos.filtered(all, q, cap: 8000)
+        }.value
+    }
 
     var body: some View {
         NavigationStack {
@@ -58,9 +69,10 @@ struct StringsTab: View {
                 .padding(12)
 
             List {
-                rows(Repos.filtered(engine.result.cstrings, query, cap: 8000))
+                rows(displayRows)
             }
             .listStyle(.plain)
+            .task(id: query) { await recompute() }
         }
     }
 
@@ -85,7 +97,8 @@ enum Repos {
     static func filtered(_ all: [String], _ query: String, cap: Int) -> [StringItem] {
         var list = all
         if !query.isEmpty {
-            list = list.filter { $0.localizedCaseInsensitiveContains(query) }
+            let q2 = query.lowercased()
+            list = list.filter { $0.lowercased().contains(q2) }
         }
         return list.prefix(cap).enumerated().map { StringItem(id: $0.offset, text: $0.element) }
     }

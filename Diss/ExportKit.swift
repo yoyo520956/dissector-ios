@@ -26,19 +26,28 @@ enum ExportKit {
         let result: AnalysisResult
     }
 
-    static func buildProject(_ s: Snapshot,
-                             progress: @escaping @Sendable (String, Int, Int) -> Void) -> (Data, Int)? {
-        var files: [ZIPEntry] = []
+    /// 流式落盘版：恒定内存（≤30MB 峰值），素材总量上限 300MB。返回 skipped 数。
+    @discardableResult
+    static func buildProjectToFile(_ s: Snapshot, to out: URL,
+                                   progress: @escaping @Sendable (String, Int, Int) -> Void) -> Int? {
+        var items: [ZIPWriter.StreamItem] = []
         var skipped = 0
         var totalBytes = 0
-        let maxTotal = 120 * 1024 * 1024
-        let maxFile = 16 * 1024 * 1024
+        let maxTotal = 300 * 1024 * 1024
+        let maxFile = 24 * 1024 * 1024
 
         func add(_ path: String, _ data: Data, countIt: Bool = true) -> Bool {
             guard data.count <= maxFile else { skipped += 1; return false }
             guard totalBytes + data.count <= maxTotal else { skipped += 1; return false }
-            files.append(ZIPEntry(path: path, data: data))
+            items.append(ZIPWriter.StreamItem(path: path, data: data, entry: nil))
             if countIt { totalBytes += data.count }
+            return true
+        }
+        func addEntry(_ path: String, _ e: ZipEntry) -> Bool {
+            guard !e.isDirectory, Int(e.size) <= maxFile else { if !e.isDirectory { skipped += 1 }; return false }
+            guard totalBytes + Int(e.size) <= maxTotal else { skipped += 1; return false }
+            totalBytes += Int(e.size)
+            items.append(ZIPWriter.StreamItem(path: path, data: nil, entry: e))
             return true
         }
 
@@ -85,11 +94,13 @@ enum ExportKit {
 
         // ③ 符号表
         progress("导出符号表", 0, 1)
-        var symText = "# 符号表 · \(s.result.symbolsFull.count) 条\n"
+        var symLines: [String] = ["# 符号表 · \(s.result.symbolsFull.count) 条"]
+        symLines.reserveCapacity(min(s.result.symbolsFull.count, 400_000) + 1)
         for sym in s.result.symbolsFull.prefix(400_000) {
-            symText += String(format: "0x%llX\t%@\n", sym.value, sym.name)
+            symLines.append(String(format: "0x%llX\t%@", sym.value, sym.name))
         }
-        _ = add("symbols.txt", Data(symText.utf8))
+        _ = add("symbols.txt", Data(symLines.joined(separator: "\n").utf8))
+        symLines = []
 
         // ④ 字符串
         progress("导出字符串", 0, 1)
@@ -112,40 +123,43 @@ enum ExportKit {
             done += 1
             if done % 15 == 0 { progress("导出 UI 与资源", done, s.entries.count) }
             guard !e.isDirectory else { continue }
-            guard let d = try? reader.data(for: e, maxBytes: maxFile) else { skipped += 1; continue }
             var rel = e.path
             if rel.hasPrefix(s.appFolder) { rel = String(rel.dropFirst(s.appFolder.count)) }
             let ext = (rel as NSString).pathExtension.lowercased()
             let base = (rel as NSString).lastPathComponent
 
-            // metadata
+            // metadata：小文件读入（保 CRC 终检）
             if rel == "Info.plist" || rel == "embedded.mobileprovision" || base == "PkgInfo" {
-                _ = add("metadata/\(base)", d)
+                if let d = try? reader.data(for: e, maxBytes: maxFile) { _ = add("metadata/\(base)", d) }
+                else { skipped += 1 }
                 continue
             }
-            // UI 类：原样 + 可读化
+            // UI 类：原样流式 + 小文件可读化
             if uiExts.contains(ext) || rel.contains(".storyboardc/") || rel.contains(".nib") {
-                _ = add("ui/\(rel)", d)
-                if let obj = try? PropertyListSerialization.propertyList(from: d, format: nil),
+                _ = addEntry("ui/\(rel)", e)
+                if e.size <= 2 * 1024 * 1024,
+                   let d = try? reader.data(for: e, maxBytes: 2 * 1024 * 1024),
+                   let obj = try? PropertyListSerialization.propertyList(from: d, format: nil),
                    let xml = try? PropertyListSerialization.data(fromPropertyList: obj, format: .xml, options: 0) {
                     _ = add("ui-xml/\(rel).xml", xml)
                 }
                 continue
             }
-            // 跳过主二进制本身（已在硬盘上）
+            // 跳过主二进制本身
             if rel == s.result.info.executable { continue }
-            // 其余资源
-            if rel.hasPrefix("Frameworks/") && ext == "dylib" { skipped += 1; continue }
-            if ext == "car" && d.count > maxFile { skipped += 1; continue }
-            _ = add("resources/\(rel)", d)
+            // 其余资源：全部流式（dylib 跳过）
+            if rel.hasPrefix("Frameworks/") && (ext == "dylib" || ext == "a") { skipped += 1; continue }
+            _ = addEntry("resources/\(rel)", e)
         }
         progress("导出 UI 与资源", s.entries.count, s.entries.count)
 
-        // 打包
-        progress("压缩打包", 0, 1)
-        guard let zip = ZIPWriter.write(files) else { return nil }
-        progress("压缩打包", 1, 1)
-        return (zip, skipped)
+        // 打包：流式落盘（恒定内存）
+        progress("打包写入", 0, items.count)
+        let ok = ZIPWriter.writeStreaming(items, to: out) { i, n in
+            progress("打包写入", i, max(n, 1))
+        }
+        guard ok else { return nil }
+        return skipped
     }
 
     // MARK: - 精简报告（不依赖主线程引擎）

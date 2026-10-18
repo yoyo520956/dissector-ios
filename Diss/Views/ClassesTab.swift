@@ -33,18 +33,32 @@ struct SymbolListView: View {
     @ObservedObject var engine: AnalysisEngine
     @State private var query = ""
 
-    private var classes: [String] { filtered(engine.result.classNames) }
-    private var methods: [String] { filtered(engine.result.methodNames) }
-    private var swiftNames: [String] { filtered(engine.result.swiftSymbols) }
-    private var machSymbols: [MachSymbol] {
-        let r = engine.result.symbolsFull
-        if query.isEmpty { return Array(r.prefix(800)) }
-        return Array(r.filter { $0.name.localizedCaseInsensitiveContains(query) }.prefix(800))
-    }
+    // 后台过滤结果（61 万符号禁每帧 filter）
+    @State private var classes: [String] = []
+    @State private var methods: [String] = []
+    @State private var swiftNames: [String] = []
+    @State private var machSymbols: [MachSymbol] = []
 
-    private func filtered(_ list: [String]) -> [String] {
-        let base = query.isEmpty ? list : list.filter { $0.localizedCaseInsensitiveContains(query) }
-        return Array(base.prefix(600))
+    private func recompute() async {
+        let q = query
+        try? await Task.sleep(nanoseconds: 220_000_000)
+        guard !Task.isCancelled, q == query else { return }
+        let cls = engine.result.classNames
+        let mth = engine.result.methodNames
+        let sw = engine.result.swiftSymbols
+        let syms = engine.result.symbolsFull
+        let q2 = q.lowercased()
+        let out = await Task.detached(priority: .userInitiated) { () -> ([String], [String], [String], [MachSymbol]) in
+            func f(_ list: [String], _ cap: Int) -> [String] {
+                q2.isEmpty ? Array(list.prefix(cap))
+                    : Array(list.filter { $0.lowercased().contains(q2) }.prefix(cap))
+            }
+            let ms = q2.isEmpty ? Array(syms.prefix(800))
+                : Array(syms.filter { $0.name.lowercased().contains(q2) }.prefix(800))
+            return (f(cls, 600), f(mth, 600), f(sw, 600), ms)
+        }.value
+        guard q == query, !Task.isCancelled else { return }
+        classes = out.0; methods = out.1; swiftNames = out.2; machSymbols = out.3
     }
 
     var body: some View {
@@ -136,5 +150,6 @@ struct SymbolListView: View {
         }
         .listStyle(.insetGrouped)
         .searchable(text: $query, prompt: "搜类名 / 方法 / 符号")
+        .task(id: query) { await recompute() }
     }
 }

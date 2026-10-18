@@ -157,6 +157,30 @@ final class ZipReader {
 
     /// 文件 MD5 指纹（前 12 位，报错诊断用；懒计算一次）
     private var _md5Cache: String?
+    /// 流式读取条目：store 分块回调；deflate 解压后一次性回调（≤maxBytes 保护）
+    func streamBytes(for entry: ZipEntry, chunk: Int = 1 << 20, sink: (Data) -> Void) throws {
+        guard !entry.isDirectory else { return }
+        try fh.seek(toOffset: entry.offset)
+        let lh = [UInt8](try readFull(fh, 30))
+        guard lh.count == 30, lh[0] == 0x50, lh[1] == 0x4b, lh[2] == 0x03, lh[3] == 0x04 else {
+            throw IPAError.notZip("局部头损坏: \(entry.path)")
+        }
+        let nameLen = Int(Self.u16(lh, 26))
+        let extraLen = Int(Self.u16(lh, 28))
+        try fh.seek(toOffset: entry.offset + 30 + UInt64(nameLen) + UInt64(extraLen))
+        if entry.method == 0 {
+            var remaining = Int(entry.packed)
+            while remaining > 0 {
+                let n = min(remaining, chunk)
+                sink(try readFull(fh, n))
+                remaining -= n
+            }
+        } else {
+            let comp = try readFull(fh, Int(entry.packed))
+            sink(try Self.inflate(comp, outSize: Int(entry.size)))
+        }
+    }
+
     func md5Fingerprint() -> String {
         if let c = _md5Cache { return c }
         guard let d = try? Data(contentsOf: fileURL) else { return "无法读取" }

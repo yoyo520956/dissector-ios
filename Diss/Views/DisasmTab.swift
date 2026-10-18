@@ -62,15 +62,22 @@ struct DisasmTab: View {
 struct FunctionListView: View {
     @ObservedObject var engine: AnalysisEngine
     @State private var query = ""
+    @State private var displayFuncs: [MachSymbol] = []
 
-    private var funcs: [MachSymbol] {
+    private func recompute() async {
+        let q = query
+        try? await Task.sleep(nanoseconds: 220_000_000)
+        guard !Task.isCancelled, q == query else { return }
+        if q.isEmpty { displayFuncs = engine.funcSymbols; return }
         let all = engine.funcSymbols
-        if query.isEmpty { return all }
-        return all.filter { $0.name.localizedCaseInsensitiveContains(query) }
+        let q2 = q.lowercased()
+        displayFuncs = await Task.detached(priority: .userInitiated) {
+            all.filter { $0.name.lowercased().contains(q2) }
+        }.value
     }
 
     var body: some View {
-        List(funcs) { f in
+        List(displayFuncs) { f in
             NavigationLink {
                 DisasmView(engine: engine, symbol: f)
             } label: {
@@ -108,8 +115,9 @@ struct FunctionListView: View {
         }
         .listStyle(.insetGrouped)
         .searchable(text: $query, prompt: "搜函数名 / Swift 符号")
+        .task(id: query) { await recompute() }
         .overlay {
-            if funcs.isEmpty {
+            if displayFuncs.isEmpty {
                 Text("没有匹配的函数")
                     .font(.footnote)
                     .foregroundStyle(.secondary)

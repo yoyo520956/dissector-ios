@@ -62,16 +62,23 @@ struct ResourceListView: View {
     @State private var selectMode = false
     @State private var selection = Set<Int>()
 
-    private var items: [ZipEntry] {
-        let files = engine.result.entries.filter { !$0.isDirectory }
-        var list = files
-        if cat != .all {
-            list = list.filter { ResCategory.of($0) == cat }
-        }
-        if !query.isEmpty {
-            list = list.filter { $0.path.localizedCaseInsensitiveContains(query) }
-        }
-        return list.sorted { $0.path < $1.path }
+    @State private var displayItems: [ZipEntry] = []
+
+    private func recompute() async {
+        let q = query
+        let c = cat
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        guard !Task.isCancelled, q == query, c == cat else { return }
+        let entries = engine.result.entries
+        displayItems = await Task.detached(priority: .userInitiated) {
+            var list = entries.filter { !$0.isDirectory }
+            if c != .all { list = list.filter { ResCategory.of($0) == c } }
+            if !q.isEmpty {
+                let q2 = q.lowercased()
+                list = list.filter { $0.path.lowercased().contains(q2) }
+            }
+            return list.sorted { $0.path < $1.path }
+        }.value
     }
 
     var body: some View {
@@ -85,13 +92,14 @@ struct ResourceListView: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
 
-            List(items) { e in
+            List(displayItems) { e in
                 row(for: e)
             }
             .listStyle(.insetGrouped)
             .searchable(text: $query, prompt: "搜资源路径")
+            .task(id: "\(query)#\(cat.rawValue)") { await recompute() }
             .overlay {
-                if items.isEmpty {
+                if displayItems.isEmpty {
                     Text("没有匹配的资源")
                         .font(.footnote)
                         .foregroundStyle(.secondary)

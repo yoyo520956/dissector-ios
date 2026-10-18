@@ -337,7 +337,7 @@ final class AnalysisEngine: ObservableObject {
 
     func dumpClasses() -> [ObjCClassDump] {
         if let c = classDumpCache { return c }
-        guard !binData.isEmpty else { return [] }
+        guard !binData.isEmpty, !warming else { return [] }   // 预热中不重复跑，UI 等翻转自动刷新
         let dumper = ObjCDumper(data: binData, segments: result.segments, sections: result.allSections)
         let classes = dumper.dump()
         classDumpCache = classes
@@ -350,7 +350,7 @@ final class AnalysisEngine: ObservableObject {
 
     func swiftMeta() -> [SwiftTypeDump] {
         if let c = swiftMetaCache { return c }
-        guard !binData.isEmpty else { return [] }
+        guard !binData.isEmpty, !warming else { return [] }
         let dumper = SwiftMetaDumper(data: binData, segments: result.segments, sections: result.allSections)
         let types = dumper.dump()
         swiftMetaCache = types
@@ -496,8 +496,11 @@ final class AnalysisEngine: ObservableObject {
 
     // MARK: - 预热（后台预建重缓存）
 
+    private var warming = false
+
     private func startWarmup() {
         guard !binData.isEmpty else { return }
+        warming = true
         let bin = binData
         let segs = result.segments
         let secs = result.allSections
@@ -512,6 +515,7 @@ final class AnalysisEngine: ObservableObject {
                 self.swiftMetaCache = meta
                 self.stringByAddr = strMap
                 self.warmupState = ""
+                self.warming = false
             }
         }
     }
@@ -552,22 +556,30 @@ final class AnalysisEngine: ObservableObject {
         exportState = "准备打包…"
         exportZipURL = nil
         Task.detached(priority: .userInitiated) { [weak self] in
-            let out = ExportKit.buildProject(snap) { phase, done, total in
+            let dir = AnalysisEngine.exportsDir()
+            let tmp = dir.appendingPathComponent("export-\(UUID().uuidString.prefix(6)).zip")
+            let skipped = ExportKit.buildProjectToFile(snap, to: tmp) { phase, done, total in
                 Task { @MainActor [weak self] in
                     self?.exportState = "\(phase) \(done)/\(total)"
                 }
             }
             await MainActor.run {
                 guard let self else { return }
-                if let (data, skipped) = out {
+                if let skipped {
                     let base = self.fileName.replacingOccurrences(of: ".ipa", with: "")
-                    if let name = self.saveExport(data, name: "\(base)-工程素材.zip") {
-                        self.exportZipURL = AnalysisEngine.exportsDir().appendingPathComponent(name)
-                        self.exportState = "完成 · \(ByteFmt.text(UInt64(data.count)))\(skipped > 0 ? " · 跳过\(skipped)个大文件" : "")"
-                    } else {
-                        self.exportState = "保存失败"
+                    let final = dir.appendingPathComponent("\(base)-工程素材.zip")
+                    try? FileManager.default.removeItem(at: final)
+                    do {
+                        try FileManager.default.moveItem(at: tmp, to: final)
+                        let sz = (try? FileManager.default.attributesOfItem(atPath: final.path)[.size] as? Int) ?? 0
+                        self.exportZipURL = final
+                        self.exportState = "完成 · \(ByteFmt.text(UInt64(sz)))\(skipped > 0 ? " · 跳过\(skipped)个大文件" : "")"
+                    } catch {
+                        try? FileManager.default.removeItem(at: tmp)
+                        self.exportState = "保存失败：\(error.localizedDescription)"
                     }
                 } else {
+                    try? FileManager.default.removeItem(at: tmp)
                     self.exportState = "打包失败（文件过大或读取错误）"
                 }
             }
