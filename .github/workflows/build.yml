@@ -1,0 +1,81 @@
+name: Build Dissector
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        run: |
+          if [ -d /Applications/Xcode_26.6.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.6.app
+          else
+            echo "Xcode_26.6.app not found; falling back to runner default"
+          fi
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Project
+        run: |
+          xcodegen generate
+          ls -la
+
+      - name: Build (unsigned IPA)
+        run: |
+          set +e
+          xcodebuild -project Dissector.xcodeproj \
+            -scheme Dissector \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            -resultBundlePath build/Diag.xcresult \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            IDEBuildOperationMaxNumberOfConcurrentCompileTasks=1 \
+            build > /tmp/full_build.log 2>&1
+          EX=$?
+          echo "xcodebuild exit code: $EX"
+          tail -300 /tmp/full_build.log
+          exit $EX
+
+      - name: Dump Diagnostics (failure forensics)
+        if: failure()
+        run: |
+          set +e
+          echo "===== 完整日志中的全部 error 行（防 tail 截断）====="
+          grep -n 'error:' /tmp/full_build.log | head -40 || echo "（无 error: 行）"
+
+      - name: Upload full build log + diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics
+          path: |
+            /tmp/full_build.log
+            build/Diag.xcresult
+          if-no-files-found: ignore
+
+      - name: Package IPA
+        run: |
+          ls build/Build/Products/Release-iphoneos/
+          test -f build/Build/Products/Release-iphoneos/Dissector.app/Dissector || (echo "FATAL: 主二进制缺失（假成功防护）" && exit 1)
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/Dissector.app Payload/
+          zip -qry Dissector-unsigned.ipa Payload
+          unzip -t Dissector-unsigned.ipa > /dev/null && echo "IPA CRC OK"
+          ls -la Dissector-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: dissector-ipa
+          path: Dissector-unsigned.ipa
+          if-no-files-found: error
