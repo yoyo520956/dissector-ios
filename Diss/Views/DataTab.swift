@@ -80,9 +80,34 @@ struct ReportView: View {
             }
             Section {
                 Button {
+                    engine.exportFullProject()
+                } label: {
+                    Label("一键导出完整工程素材包", systemImage: "shippingbox.fill")
+                }
+                .disabled(engine.exportState != nil)
+                if let st = engine.exportState {
+                    HStack {
+                        if engine.exportZipURL == nil {
+                            ProgressView()
+                        }
+                        Text(st).font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
+                if let u = engine.exportZipURL {
+                    ShareLink(item: u) {
+                        Label("分享工程素材包", systemImage: "square.and.arrow.up")
+                    }
+                }
+            } header: {
+                Text("工程素材包")
+            } footer: {
+                Text("含：classes/ 全部类头文件 · ui/ 界面文件(storyboard/nib)与可读 XML · resources/ 全部素材 · symbols/strings/network/report —— 可直接用于重建 App 的代码结构与界面")
+            }
+            Section {
+                Button {
                     exportReport()
                 } label: {
-                    Label("生成完整 HTML 报告", systemImage: "doc.richtext")
+                    Label("生成 HTML 报告", systemImage: "doc.richtext")
                 }
                 if let u = fileURL {
                     ShareLink(item: u) {
@@ -90,7 +115,7 @@ struct ReportView: View {
                     }
                 }
             } footer: {
-                Text("报告保存到 exports/ 目录，包含概览/结构/类转储/符号/字符串/网络/风控/隐私全部九段")
+                Text("报告保存到 exports/ 目录")
             }
         }
     }

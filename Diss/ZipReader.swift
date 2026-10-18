@@ -9,6 +9,8 @@ import CryptoKit
 final class ZipReader {
     private let fh: FileHandle
     private let fileURL: URL
+    /// 供导出模块使用（独立 reader 避免并发）
+    var fileURLForExport: URL { fileURL }
     private let fileSize: UInt64
     private(set) var entries: [ZipEntry] = []
     private var entryByPath: [String: ZipEntry] = [:]

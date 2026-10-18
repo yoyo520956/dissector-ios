@@ -40,6 +40,13 @@ final class AnalysisEngine: ObservableObject {
     @Published var callGraph: [UInt64: [XrefSite]] = [:]
     @Published var xrefStats: (targets: Int, sites: Int) = (0, 0)
 
+    // 预热状态（后台预建类转储/Swift/字符串映射缓存，页签秒开）
+    @Published var warmupState: String = ""
+
+    // 全量导出状态
+    @Published var exportState: String? = nil
+    @Published var exportZipURL: URL? = nil
+
     // MARK: - 导入三通道
 
     /// 文件选择器 / 分享打开 走这里：先入库（拷到 Documents），再分析
@@ -103,6 +110,10 @@ final class AnalysisEngine: ObservableObject {
         funcSymbolMap = [:]
         callGraph = [:]
         xrefStats = (0, 0)
+        cachedFuncSymbols = []
+        warmupState = ""
+        exportState = nil
+        exportZipURL = nil
     }
 
     // MARK: - 主流程
@@ -122,7 +133,11 @@ final class AnalysisEngine: ObservableObject {
             callGraph = pack.callGraph
             xrefStats = pack.xrefStats
             funcSymbolMap = pack.funcMap
+            cachedFuncSymbols = pack.result.symbolsFull
+                .filter { $0.kind == "func" }
+                .sorted { $0.value < $1.value }
             phase = .done
+            startWarmup()
         } catch {
             phase = .failed(error.localizedDescription)
         }
@@ -261,9 +276,10 @@ final class AnalysisEngine: ObservableObject {
 
     // MARK: - 反汇编数据源
 
-    var funcSymbols: [MachSymbol] {
-        result.symbolsFull.filter { $0.kind == "func" }.sorted { $0.value < $1.value }
-    }
+    /// 缓存的函数符号（勿实时 filter——61 万符号重排是 UI 卡顿头号源）
+    @Published var cachedFuncSymbols: [MachSymbol] = []
+
+    var funcSymbols: [MachSymbol] { cachedFuncSymbols }
 
     func disassembleFunction(at va: UInt64, maxInstructions: Int) -> [DisasmLine] {
         guard let t = result.textSection, !binData.isEmpty else { return [] }
@@ -359,27 +375,7 @@ final class AnalysisEngine: ObservableObject {
 
     private func buildStringMap() {
         guard stringByAddr.isEmpty, !binData.isEmpty else { return }
-        let parser = MachOParser(data: binData)
-        let names: Set<String> = ["__cstring", "__objc_classname", "__objc_methname", "__objc_methtype", "__ustring"]
-        for sec in result.allSections where names.contains(sec.name) {
-            let d = parser.sectionData(sec, from: binData, limit: 16 * 1024 * 1024)
-            let bytes = [UInt8](d)
-            var start = 0
-            var i = 0
-            while i < bytes.count {
-                if bytes[i] == 0 {
-                    if i > start {
-                        let s = String(bytes: bytes[start..<i], encoding: .utf8)
-                            ?? String(bytes: bytes[start..<i], encoding: .isoLatin1)
-                        if let s = s, !s.isEmpty, s.count < 200 {
-                            stringByAddr[sec.addr + UInt64(start)] = s
-                        }
-                    }
-                    start = i + 1
-                }
-                i += 1
-            }
-        }
+        stringByAddr = AnalysisEngine.buildStringMapCore(bin: binData, sections: result.allSections)
     }
 
     func stringAt(vm: UInt64) -> String? {
@@ -418,6 +414,8 @@ final class AnalysisEngine: ObservableObject {
         return await withCheckedContinuation { cont in
             DispatchQueue.global().async {
                 let items = IntegrityCheck.run(entries: z.entries, reader: z) { done, total in
+                    // 节流：每 30 条或末条才回主线程（防 Task 洪水卡 UI）
+                    guard done % 30 == 0 || done == total else { return }
                     Task { @MainActor in
                         self.integrityProgress = (done, total)
                     }
@@ -494,6 +492,86 @@ final class AnalysisEngine: ObservableObject {
     func callers(of va: UInt64, limit: Int = 200) -> [XrefSite] {
         let sites = callGraph[va] ?? []
         return Array(sites.sorted { $0.fromVA < $1.fromVA }.prefix(limit))
+    }
+
+    // MARK: - 预热（后台预建重缓存）
+
+    private func startWarmup() {
+        guard !binData.isEmpty else { return }
+        let bin = binData
+        let segs = result.segments
+        let secs = result.allSections
+        warmupState = "预热索引…"
+        Task.detached(priority: .utility) { [weak self] in
+            let classes = ObjCDumper(data: bin, segments: segs, sections: secs).dump()
+            let meta = SwiftMetaDumper(data: bin, segments: segs, sections: secs).dump()
+            let strMap = AnalysisEngine.buildStringMapCore(bin: bin, sections: secs)
+            await MainActor.run {
+                guard let self else { return }
+                self.classDumpCache = classes
+                self.swiftMetaCache = meta
+                self.stringByAddr = strMap
+                self.warmupState = ""
+            }
+        }
+    }
+
+    /// 字符串映射纯函数版（预热与实例共用）
+    nonisolated static func buildStringMapCore(bin: Data, sections: [MachSection]) -> [UInt64: String] {
+        var map: [UInt64: String] = [:]
+        let parser = MachOParser(data: bin)
+        let names: Set<String> = ["__cstring", "__objc_classname", "__objc_methname", "__objc_methtype", "__ustring"]
+        for sec in sections where names.contains(sec.name) {
+            let d = parser.sectionData(sec, from: bin, limit: 16 * 1024 * 1024)
+            let bytes = [UInt8](d)
+            var start = 0
+            var i = 0
+            while i < bytes.count {
+                if bytes[i] == 0 {
+                    if i > start, i - start < 200 {
+                        if let str = String(bytes: bytes[start..<i], encoding: .utf8), !str.isEmpty {
+                            map[sec.addr + UInt64(start)] = str
+                        }
+                    }
+                    start = i + 1
+                }
+                i += 1
+            }
+        }
+        return map
+    }
+
+    // MARK: - 一键导出完整工程素材包
+
+    func exportFullProject() {
+        guard exportState == nil, !binData.isEmpty, let z = zip else { return }
+        let snap = ExportKit.Snapshot(fileName: fileName, url: z.fileURLForExport,
+                                      bin: binData, segments: result.segments,
+                                      sections: result.allSections, entries: result.entries,
+                                      appFolder: result.appFolder, result: result)
+        exportState = "准备打包…"
+        exportZipURL = nil
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let out = ExportKit.buildProject(snap) { phase, done, total in
+                Task { @MainActor [weak self] in
+                    self?.exportState = "\(phase) \(done)/\(total)"
+                }
+            }
+            await MainActor.run {
+                guard let self else { return }
+                if let (data, skipped) = out {
+                    let base = self.fileName.replacingOccurrences(of: ".ipa", with: "")
+                    if let name = self.saveExport(data, name: "\(base)-工程素材.zip") {
+                        self.exportZipURL = AnalysisEngine.exportsDir().appendingPathComponent(name)
+                        self.exportState = "完成 · \(ByteFmt.text(UInt64(data.count)))\(skipped > 0 ? " · 跳过\(skipped)个大文件" : "")"
+                    } else {
+                        self.exportState = "保存失败"
+                    }
+                } else {
+                    self.exportState = "打包失败（文件过大或读取错误）"
+                }
+            }
+        }
     }
 
     // MARK: - 导出（Documents/exports/）
